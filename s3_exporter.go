@@ -62,9 +62,10 @@ var (
 
 // Exporter is our exporter type
 type Exporter struct {
-	bucket string
-	prefix string
-	svc    s3iface.S3API
+	bucket        string
+	prefix        string
+	svc           s3iface.S3API
+	listObjectsV2 bool
 }
 
 // Describe all the metrics we export
@@ -86,37 +87,76 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	var biggestObjectSize int64
 	var lastObjectSize int64
 
-	query := &s3.ListObjectsV2Input{
-		Bucket: &e.bucket,
-		Prefix: &e.prefix,
-	}
-
-	// Continue making requests until we've listed and compared the date of every object
 	startList := time.Now()
-	for {
-		resp, err := e.svc.ListObjectsV2(query)
-		if err != nil {
-			log.Errorln(err)
-			ch <- prometheus.MustNewConstMetric(
-				s3ListSuccess, prometheus.GaugeValue, 0, e.bucket, e.prefix,
-			)
-			return
+
+	if e.listObjectsV2 {
+
+		query := &s3.ListObjectsV2Input{
+			Bucket: &e.bucket,
+			Prefix: &e.prefix,
 		}
-		for _, item := range resp.Contents {
-			numberOfObjects++
-			totalSize = totalSize + *item.Size
-			if item.LastModified.After(lastModified) {
-				lastModified = *item.LastModified
-				lastObjectSize = *item.Size
+
+		// Continue making requests until we've listed and compared the date of every object
+		for {
+			resp, err := e.svc.ListObjectsV2(query)
+			if err != nil {
+				log.Errorln(err)
+				ch <- prometheus.MustNewConstMetric(
+					s3ListSuccess, prometheus.GaugeValue, 0, e.bucket, e.prefix,
+				)
+				return
 			}
-			if *item.Size > biggestObjectSize {
-				biggestObjectSize = *item.Size
+			for _, item := range resp.Contents {
+				numberOfObjects++
+				totalSize = totalSize + *item.Size
+				if item.LastModified.After(lastModified) {
+					lastModified = *item.LastModified
+					lastObjectSize = *item.Size
+				}
+				if *item.Size > biggestObjectSize {
+					biggestObjectSize = *item.Size
+				}
 			}
+			if resp.NextContinuationToken == nil {
+				break
+			}
+			query.ContinuationToken = resp.NextContinuationToken
 		}
-		if resp.NextContinuationToken == nil {
+	} else {
+
+		query := &s3.ListObjectsInput{
+			Bucket: &e.bucket,
+			Prefix: &e.prefix,
+		}
+
+		// Continue making requests until we've listed and compared the date of every object
+		for {
+			resp, err := e.svc.ListObjects(query)
+			if err != nil {
+				log.Errorln(err)
+				ch <- prometheus.MustNewConstMetric(
+					s3ListSuccess, prometheus.GaugeValue, 0, e.bucket, e.prefix,
+				)
+				return
+			}
+			for _, item := range resp.Contents {
+				numberOfObjects++
+				totalSize = totalSize + *item.Size
+				if item.LastModified.After(lastModified) {
+					lastModified = *item.LastModified
+					lastObjectSize = *item.Size
+				}
+				if *item.Size > biggestObjectSize {
+					biggestObjectSize = *item.Size
+				}
+			}
+
+			if *resp.IsTruncated {
+				query.SetMarker(*resp.NextMarker)
+				continue
+			}
 			break
 		}
-		query.ContinuationToken = resp.NextContinuationToken
 	}
 	listDuration := time.Now().Sub(startList).Seconds()
 
@@ -152,10 +192,20 @@ func probeHandler(w http.ResponseWriter, r *http.Request, svc s3iface.S3API) {
 
 	prefix := r.URL.Query().Get("prefix")
 
+	listObjectsV2 := true
+
+	listObjectsV2Str := r.URL.Query().Get("listobjectsv2")
+	if listObjectsV2Str != "" {
+		if listObjectsV2Str == "false" || listObjectsV2Str == "0" {
+			listObjectsV2 = false
+		}
+	}
+
 	exporter := &Exporter{
-		bucket: bucket,
-		prefix: prefix,
-		svc:    svc,
+		bucket:        bucket,
+		prefix:        prefix,
+		svc:           svc,
+		listObjectsV2: listObjectsV2,
 	}
 
 	registry := prometheus.NewRegistry()
